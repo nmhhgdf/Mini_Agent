@@ -23,6 +23,19 @@
       },
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
+    },
+    {
+      "name": "mini-agent (stream)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}",
+      "args": ["-stream", "-task", "读取 big-file.txt 的最后 10 行，告诉我最后一行是什么"],
+      "env": {
+        "DEEPSEEK_API_KEY": "${env:DEEPSEEK_API_KEY}"
+      },
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
     }
   ]
 }

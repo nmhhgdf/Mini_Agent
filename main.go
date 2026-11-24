@@ -39,10 +39,17 @@ type Usage struct {
 }
 
 type ChatRequest struct {
-	Model     string    `json:"model"`
-	Messages  []Message `json:"messages"`
-	Tools     []toolDef `json:"tools,omitempty"`
-	MaxTokens int       `json:"max_tokens,omitempty"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	Tools         []toolDef      `json:"tools,omitempty"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
+	Stream        bool           `json:"stream,omitempty"`
+	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
+}
+
+// StreamOptions 让流式的最后一个 chunk 也带 usage。
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type ChatResponse struct {
@@ -60,10 +67,11 @@ type Config struct {
 }
 
 type Agent struct {
-	cfg   Config
-	mock  bool
-	log   *os.File
-	usage Usage
+	cfg    Config
+	mock   bool
+	stream bool
+	log    *os.File
+	usage  Usage
 }
 
 func envOr(key, def string) string {
@@ -75,6 +83,7 @@ func envOr(key, def string) string {
 
 func main() {
 	mock := flag.Bool("mock", false, "用假模型跑通循环，不调用 API")
+	stream := flag.Bool("stream", false, "使用流式输出（SSE）")
 	task := flag.String("task", "读取 go.mod，告诉我 module 名和 go 版本，然后用一句话说明你用了哪些工具。", "交给 agent 的任务")
 	maxSteps := flag.Int("max-steps", 8, "最多模型调用次数")
 	flag.Parse()
@@ -96,11 +105,12 @@ func main() {
 	}
 	defer logFile.Close()
 
-	a := &Agent{cfg: cfg, mock: *mock, log: logFile}
+	a := &Agent{cfg: cfg, mock: *mock, stream: *stream, log: logFile}
 	if err := a.Run(context.Background(), *task, *maxSteps); err != nil {
 		fmt.Fprintln(os.Stderr, "\n[agent 失败]", err)
 		os.Exit(1)
 	}
+	fmt.Printf("\n[总用量] prompt=%d completion=%d total=%d\n", a.usage.PromptTokens, a.usage.CompletionTokens, a.usage.TotalTokens)
 }
 
 func (a *Agent) Run(ctx context.Context, task string, maxSteps int) error {
@@ -111,7 +121,13 @@ func (a *Agent) Run(ctx context.Context, task string, maxSteps int) error {
 
 	for step := 1; step <= maxSteps; step++ {
 		req := ChatRequest{Model: a.cfg.Model, Messages: msgs, Tools: toolDefs(), MaxTokens: 1024}
-		resp, err := a.complete(ctx, req)
+		var resp *ChatResponse
+		var err error
+		if a.stream {
+			resp, err = a.streamComplete(ctx, req)
+		} else {
+			resp, err = a.complete(ctx, req)
+		}
 		if err != nil {
 			return fmt.Errorf("step %d 请求失败: %w", step, err)
 		}
@@ -127,7 +143,9 @@ func (a *Agent) Run(ctx context.Context, task string, maxSteps int) error {
 		fmt.Printf("\n── step %d ──  prompt=%d completion=%d\n", step, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 
 		if len(msg.ToolCalls) == 0 {
-			fmt.Println("\nassistant:", msg.Content)
+			if !a.stream || a.mock {
+				fmt.Println("\nassistant:", msg.Content)
+			}
 			a.writeLog(step, msg, nil, resp.Usage)
 			return nil
 		}

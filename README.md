@@ -8,7 +8,7 @@
 |---|---|---|
 | `Run()` 里的 for 循环 | `ReactLoopAgent.turn()/step()` | 一轮里可以有多步 |
 | `messages` 数组 | `session` 日志 + `deriveMessages()` | 这里直接放内存，DSH 从日志派生 |
-| `complete()` | `ctx.llm.stream()` | 这里非流式，DSH 是流式 |
+| `complete()` / `streamComplete()` | `ctx.llm.stream()` | 非流式 / SSE 流式 |
 | `runTool()` | `ctx.tools.execute()` + pipeline | 这里没有审批/沙箱/并发 |
 | `session.jsonl` | JSONL 会话持久化 | 每步落一行 |
 
@@ -39,9 +39,20 @@ $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 ## 在 VSCode 里调试
 
 1. 需要 Go 扩展 + Delve（两者都已装好；Delve 在 `%USERPROFILE%\go\bin\dlv.exe`）
-2. 用 VSCode 打开 `mini-agent` 文件夹，按 `F5`，选 **mini-agent (mock)**
+2. 用 VSCode 打开 `mini-agent` 文件夹，按 `F5`，选 **mini-agent (mock)** / **(DeepSeek)** / **(stream)**
 3. 在 `main.go` 的 `Run()` 循环里下断点（比如 `resp, err := a.complete(...)`），用 `F10` 单步、`F5` 继续
 4. 想看变量：左侧 **Run and Debug** 面板的 Variables / Call Stack
+
+**调试流式**：`stream.go` 的 `parseStream` 每个 chunk 都会执行，普通断点会停很多次。在断点行右键 → **Add Conditional Breakpoint**，条件写：
+
+```go
+payload == "[DONE]"
+len(payload) > 400
+```
+
+（Delve 的条件表达式支持简单运算，别写函数调用；够用了。）
+
+然后看 `payload`、`ch`、`res.Content`、`calls` 这几个变量，就能看清 SSE 一块块到达的过程。
 
 跑真实模型前，先在你启动 VSCode 的那个终端里设置 key，再启动：
 
@@ -61,6 +72,10 @@ code .
   - `readFile()`：限制在工作目录内，支持 `offset`/`limit` 分页，单次返回受 6000 字符预算约束
   - `grepFiles()`：纯 Go 正则搜索，返回 `文件:行号: 内容` 和总匹配数，不经过 shell
   - `runCommand()`：`cmd /C`，30 秒超时，输出截断
+- `stream.go`
+  - `parseStream()`：解析 SSE（`data:`、空行、`[DONE]`），拼接 `delta.content` 和 `delta.tool_calls`
+  - `streamComplete()`：发流式请求、边收边打印、把增量还原成一条完整消息
+- `shell_windows.go` / `shell_other.go`：按平台构造 shell 命令
 
 ## 实验 1：上下文爆炸（用 `big-file.txt`）
 
@@ -93,6 +108,21 @@ go run . -task "读取 big-file.txt 的最后 10 行，告诉我最后一行是�
 | 5. 分页后（已实现） | | | 能（先读头拿 total_lines，再跳读） |
 
 结论：**读文件工具必须支持分页**（offset/limit），否则要么截断丢信息，要么把整个文件塞进上下文。这就是 DSH 的文件工具带行号范围和结果裁剪的原因。
+
+## 实验 2：流式输出
+
+```powershell
+go run . -stream -task "读取 big-file.txt 的最后 10 行，告诉我最后一行是什么"
+```
+
+对照观察：
+
+1. 文本是不是逐字出现，首字延迟和总耗时差多少
+2. 工具调用那一步没有正文，要等工具结果回来、下一轮才继续出字
+3. 不加 `-stream` 再跑一次，对比输出节奏和 `[总用量]`
+4. 读 `stream.go` 的 `parseStream()`：`data:` 前缀、空行、`[DONE]`、`finish_reason` 各在哪处理
+
+想看得更细，可以在 `parseStream` 里临时打印每个 chunk 的 `finish_reason` 和 `delta`，观察 `tool_calls` 的 `arguments` 是怎么一块块拼起来的。
 
 ## 七个练习（按顺序做，每个都对应 DSH 的一个设计）
 
