@@ -105,7 +105,7 @@ func main() {
 
 func (a *Agent) Run(ctx context.Context, task string, maxSteps int) error {
 	msgs := []Message{
-		{Role: "system", Content: "你是一个最小可用的编码 Agent。需要事实时先调用工具；工具失败时自己修正；回答用中文，尽量简洁。"},
+		{Role: "system", Content: "你是一个最小可用的编码 Agent。需要事实时先调用工具；工具失败时自己修正；回答用中文，尽量简洁。读文件用 read_file，搜索用 grep；不要用 run_command 执行 dir/ls 来探索目录。"},
 		{Role: "user", Content: task},
 	}
 

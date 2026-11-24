@@ -1,4 +1,4 @@
-# mini-agent（约 300 行 Go）
+# mini-agent（约 370 行 Go）
 
 一个用来理解 AI Agent 内部结构的最小实现：**一次模型请求 + 工具调用 + 结果回灌 + 会话日志**。
 
@@ -17,6 +17,7 @@
 先跑假模型，确认循环是通的（不花钱、不需要 key）：
 
 ```powershell
+chcp 65001   # 让控制台按 UTF-8 显示中文，只需一次
 cd D:\Develop\Workspace\AI\mini-agent
 go run . -mock
 ```
@@ -56,13 +57,46 @@ code .
   - `complete()`：POST `/chat/completions`，完全 OpenAI 兼容格式
   - `writeLog()`：每一步追加一行 `session.jsonl`
 - `tools.go`
-  - `toolDefs()`：两个工具的 JSON Schema（模型看到的就是这个）
-  - `readFile()`：限制在工作目录内，读 64KB、返回最多 6000 字符
+  - `toolDefs()`：三个工具的 JSON Schema（模型看到的就是这个）
+  - `readFile()`：限制在工作目录内，支持 `offset`/`limit` 分页，单次返回受 6000 字符预算约束
+  - `grepFiles()`：纯 Go 正则搜索，返回 `文件:行号: 内容` 和总匹配数，不经过 shell
   - `runCommand()`：`cmd /C`，30 秒超时，输出截断
+
+## 实验 1：上下文爆炸（用 `big-file.txt`）
+
+`big-file.txt` 是本地生成的测试日志：**4001 行、367 KB**，最后一行藏着 `FINAL: deployment completed revision=abc123`。它被 `.gitignore` 忽略，不会提交。
+
+按顺序执行，每次记下 `step 1` 的 `prompt_tokens`：
+
+```powershell
+# 1) 基线：小文件
+go run . -task "读取 go.mod，一句话说明这是什么项目"
+
+# 2) 大文件：默认截断（maxToolChars = 6000）
+go run . -task "读取 big-file.txt，用一句话总结它是什么日志"
+
+# 3) 问结尾：模型应该看不到（内容被截断）
+go run . -task "读取 big-file.txt，告诉我最后一行是什么"
+
+# 4) 把 tools.go 里的 maxToolChars 改成 60000，重跑第 2 步
+# 5) 改回 6000。分页已经实现：先读一次拿到 total_lines，再跳到结尾
+go run . -task "读取 big-file.txt 的最后 10 行，告诉我最后一行是什么"
+```
+
+记录表（自己填）：
+
+| 实验 | prompt_tokens | 耗时 | 模型能看到结尾吗 |
+|---|---|---|---|
+| 1. go.mod | | | 不适用 |
+| 2. big-file（6000） | | | 不能（只发送前 ~66 行） |
+| 4. big-file（60000） | | | 不能（单次仍受字符预算限制，但能看到 total_lines） |
+| 5. 分页后（已实现） | | | 能（先读头拿 total_lines，再跳读） |
+
+结论：**读文件工具必须支持分页**（offset/limit），否则要么截断丢信息，要么把整个文件塞进上下文。这就是 DSH 的文件工具带行号范围和结果裁剪的原因。
 
 ## 七个练习（按顺序做，每个都对应 DSH 的一个设计）
 
-1. **上下文爆炸**：让它 `read_file` 读 `pnpm-lock.yaml` 或一个几 MB 的日志，观察 `prompt_tokens` 暴涨，再把 `maxToolChars` 从 6000 改成 500，看模型表现差异。
+1. **上下文爆炸**：见上一节 `big-file.txt` 实验。
 2. **工具报错**：把 `path` 改成不存在的文件，观察模型会不会自己换路径重试；再让它执行一条不存在的命令。
 3. **加第三个工具**：`write_file`。体会工具描述（description）写得好不好，直接决定模型会不会用对。
 4. **流式**：把 `stream` 改成 `true`，处理 SSE 和 `tool_calls` 增量拼接。这就是 DSH 的 `AssistantStreamAttempt` 在干的事。
