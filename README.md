@@ -75,6 +75,9 @@ code .
 - `stream.go`
   - `parseStream()`：解析 SSE（`data:`、空行、`[DONE]`），拼接 `delta.content` 和 `delta.tool_calls`
   - `streamComplete()`：发流式请求、边收边打印、把增量还原成一条完整消息
+- `compact.go`
+  - `findTailStart()`：选保留尾部，保证不以 `tool` 开头（不拆散工具调用和结果）
+  - `compact()`：把较早的消息总结成一条 system 摘要，保留原始任务和最近几条
 - `shell_windows.go` / `shell_other.go`：按平台构造 shell 命令
 
 ## 实验 1：上下文爆炸（用 `big-file.txt`）
@@ -123,6 +126,47 @@ go run . -stream -task "读取 big-file.txt 的最后 10 行，告诉我最后�
 4. 读 `stream.go` 的 `parseStream()`：`data:` 前缀、空行、`[DONE]`、`finish_reason` 各在哪处理
 
 想看得更细，可以在 `parseStream` 里临时打印每个 chunk 的 `finish_reason` 和 `delta`，观察 `tool_calls` 的 `arguments` 是怎么一块块拼起来的。
+
+## 实验 3：上下文压缩
+
+`-compact-at` 指定触发阈值（`prompt_tokens` 超过它才压缩，`0` 关闭）；`-compact-min` 是旧消息的最小字符数，太短就不值得摘要。
+
+先跑一个小任务：
+
+```powershell
+go run . -compact-at 800 -task "读取 big-file.txt 第 1 行，取出 latency 数值 L；再读取第 L 行，取出 latency 数值 M；再读取第 M 行；最后报告这三行的 req 编号。"
+```
+
+这会打印：
+
+```
+[compaction] 跳过：旧消息只有 130 字符（阈值 1200）
+```
+
+**这是正确的**：两小段消息摘要出来反而更长，压缩不划算。
+
+要真正触发，需要每一步都读大段内容，让旧消息足够多：
+
+```powershell
+go run . -compact-at 800 -compact-keep 3 -task "读取 big-file.txt 第 1-100 行，取第 1 行的 latency 数值 L1；再读取第 L1 行前后各 50 行，取这一段第 1 行的 latency 数值 L2；再读取第 L2 行前后各 50 行，取这一段第 1 行的 latency 数值 L3；最后报告 L1、L2、L3。"
+```
+
+`-compact-keep 3` 表示只保留最近 3 条消息。默认 4 时，多工具步会让“最近 4 条”全落在最后一步，前面没有可压的旧消息，所以不会触发。
+
+后一次读取依赖前一次的结果，所以会顺序走三步，历史里累计约 2 万字符。这时应该看到：
+
+```
+[compaction] 消息 8 → 7，摘要 N 字，摘要用量 prompt=... completion=...
+```
+
+观察：
+
+1. 压缩发生在哪一步、当时 `prompt_tokens` 多大
+2. 压缩后下一次请求的 `prompt_tokens` 降了多少
+3. 最终答案是否正确（摘要有没有丢关键信息）
+4. `session.jsonl` 里会多出 `"type":"compaction"` 的行
+
+**注意**：如果历史不够长（消息少于 8 条，或旧消息少于 `-compact-min` 字符），会跳过压缩。这是有意的——小历史摘要不划算。
 
 ## 七个练习（按顺序做，每个都对应 DSH 的一个设计）
 

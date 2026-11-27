@@ -67,11 +67,14 @@ type Config struct {
 }
 
 type Agent struct {
-	cfg    Config
-	mock   bool
-	stream bool
-	log    *os.File
-	usage  Usage
+	cfg         Config
+	mock        bool
+	stream      bool
+	compactAt   int
+	compactMin  int
+	compactKeep int
+	log         *os.File
+	usage       Usage
 }
 
 func envOr(key, def string) string {
@@ -84,6 +87,9 @@ func envOr(key, def string) string {
 func main() {
 	mock := flag.Bool("mock", false, "用假模型跑通循环，不调用 API")
 	stream := flag.Bool("stream", false, "使用流式输出（SSE）")
+	compactAt := flag.Int("compact-at", 2500, "prompt_tokens 超过该值时压缩上下文；0 表示关闭")
+	compactMin := flag.Int("compact-min", 1200, "旧消息少于该字符数时跳过压缩（防止摘要比原文还长）")
+	compactKeep := flag.Int("compact-keep", 4, "压缩时保留最近多少条消息（越小越容易触发）")
 	task := flag.String("task", "读取 go.mod，告诉我 module 名和 go 版本，然后用一句话说明你用了哪些工具。", "交给 agent 的任务")
 	maxSteps := flag.Int("max-steps", 8, "最多模型调用次数")
 	flag.Parse()
@@ -105,7 +111,7 @@ func main() {
 	}
 	defer logFile.Close()
 
-	a := &Agent{cfg: cfg, mock: *mock, stream: *stream, log: logFile}
+	a := &Agent{cfg: cfg, mock: *mock, stream: *stream, compactAt: *compactAt, compactMin: *compactMin, compactKeep: *compactKeep, log: logFile}
 	if err := a.Run(context.Background(), *task, *maxSteps); err != nil {
 		fmt.Fprintln(os.Stderr, "\n[agent 失败]", err)
 		os.Exit(1)
@@ -115,12 +121,13 @@ func main() {
 
 func (a *Agent) Run(ctx context.Context, task string, maxSteps int) error {
 	msgs := []Message{
-		{Role: "system", Content: "你是一个最小可用的编码 Agent。需要事实时先调用工具；工具失败时自己修正；回答用中文，尽量简洁。读文件用 read_file，搜索用 grep；不要用 run_command 执行 dir/ls 来探索目录。"},
+		{Role: "system", Content: "你是一个最小可用的编码 Agent。需要事实时先调用工具；工具失败时自己修正；回答用中文，尽量简洁。读文件用 read_file（需要更多行就用 offset/limit 分页），搜索用 grep；不要用 run_command 执行 dir/ls/findstr/Select-String 做探索或搜索。"},
 		{Role: "user", Content: task},
 	}
 
 	for step := 1; step <= maxSteps; step++ {
 		req := ChatRequest{Model: a.cfg.Model, Messages: msgs, Tools: toolDefs(), MaxTokens: 1024}
+		fmt.Printf("\n── step %d ──\n", step)
 		var resp *ChatResponse
 		var err error
 		if a.stream {
@@ -134,13 +141,13 @@ func (a *Agent) Run(ctx context.Context, task string, maxSteps int) error {
 		if len(resp.Choices) == 0 {
 			return fmt.Errorf("step %d 没有返回 choices", step)
 		}
+		fmt.Printf("[usage] prompt=%d completion=%d\n", resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 		a.usage.PromptTokens += resp.Usage.PromptTokens
 		a.usage.CompletionTokens += resp.Usage.CompletionTokens
 		a.usage.TotalTokens += resp.Usage.TotalTokens
 
 		msg := resp.Choices[0].Message
 		msgs = append(msgs, msg)
-		fmt.Printf("\n── step %d ──  prompt=%d completion=%d\n", step, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 
 		if len(msg.ToolCalls) == 0 {
 			if !a.stream || a.mock {
@@ -164,6 +171,15 @@ func (a *Agent) Run(ctx context.Context, task string, maxSteps int) error {
 		}
 		msgs = append(msgs, results...)
 		a.writeLog(step, msg, results, resp.Usage)
+
+		if a.compactAt > 0 && resp.Usage.PromptTokens >= a.compactAt {
+			compacted, err := a.compact(ctx, msgs, step)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[compaction 失败] %v\n", err)
+			} else {
+				msgs = compacted
+			}
+		}
 	}
 
 	return errors.New("达到 max-steps 仍未结束：检查工具是否总是失败，或调大 -max-steps")
@@ -211,6 +227,7 @@ func (a *Agent) complete(ctx context.Context, req ChatRequest) (*ChatResponse, e
 // writeLog 模拟 DSH 的会话日志：每一步把 assistant 消息和工具结果追加成一行 JSON。
 func (a *Agent) writeLog(step int, assistant Message, results []Message, usage Usage) {
 	entry := map[string]any{
+		"type":      "step",
 		"step":      step,
 		"assistant": assistant,
 		"usage":     usage,
